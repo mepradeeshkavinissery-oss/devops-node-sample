@@ -1,0 +1,26 @@
+{
+  "name": "devops-node-sample",
+  "version": "1.0.0",
+  "description": "Sample Node.js app for a GitHub Actions CI/CD pipeline: self-hosted runner, workflow_dispatch (dev/prod), SonarQube, Nexus, deploy to EC2.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "NODE_ENV=development node src/server.js",
+    "test": "jest --coverage --coverageReporters=lcov --coverageReporters=text",
+    "lint": "eslint src --ext .js || true"
+  },
+  "keywords": ["devops", "ci-cd", "github-actions", "sonarqube", "nexus", "ec2"],
+  "author": "DevOps Class",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^7.0.0",
+    "eslint": "^8.57.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,186 @@
+name: CI-CD Pipeline
+
+# ============================================================
+# TRIGGER
+# ------------------------------------------------------------
+# This pipeline is started MANUALLY from the Actions tab using
+# "Run workflow". The person running it chooses the target
+# environment (dev or prod). It also runs CI automatically on
+# every push so code is always tested.
+# ============================================================
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Which environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+      run_deploy:
+        description: 'Deploy after build? (uncheck to only build & scan)'
+        required: true
+        default: true
+        type: boolean
+
+# Cancel an older run of the same branch if a new one starts
+concurrency:
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ==========================================================
+  # JOB 1 — BUILD, TEST, SONARQUBE, PUBLISH TO NEXUS
+  # Runs on your SELF-HOSTED runner (label: self-hosted).
+  # ==========================================================
+  build:
+    name: Build · Test · Scan · Publish
+    runs-on: [ self-hosted, linux ]   # <-- your registered self-hosted runner
+
+    outputs:
+      artifact_name: ${{ steps.pack.outputs.artifact_name }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # full history — SonarQube likes this
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run tests with coverage
+        run: npm test
+
+      # ---- SonarQube static analysis + quality gate ----
+      - name: SonarQube scan
+        uses: sonarsource/sonarqube-scan-action@v2
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - name: SonarQube quality gate
+        uses: sonarsource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      # ---- Package the app into a versioned tarball artifact ----
+      - name: Package application
+        id: pack
+        run: |
+          VERSION="${{ github.run_number }}-$(echo ${{ github.sha }} | cut -c1-7)"
+          ARTIFACT="devops-node-sample-${VERSION}.tgz"
+          echo "Building artifact: $ARTIFACT"
+          # bundle only what the server needs at runtime
+          tar -czf "$ARTIFACT" \
+            package.json package-lock.json src \
+            scripts/start-app.sh
+          echo "artifact_name=$ARTIFACT" >> "$GITHUB_OUTPUT"
+          echo "ARTIFACT=$ARTIFACT" >> "$GITHUB_ENV"
+
+      # ---- Upload the artifact to Nexus (raw hosted repository) ----
+      - name: Publish artifact to Nexus
+        run: |
+          echo "Uploading $ARTIFACT to Nexus..."
+          curl -sS --fail \
+            -u "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
+            --upload-file "$ARTIFACT" \
+            "${{ secrets.NEXUS_URL }}/repository/node-artifacts/${ARTIFACT}"
+          echo "Uploaded to Nexus: ${{ secrets.NEXUS_URL }}/repository/node-artifacts/${ARTIFACT}"
+
+      # ---- Also keep a copy on the GitHub run for easy download ----
+      - name: Upload artifact to GitHub run
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-package
+          path: ${{ env.ARTIFACT }}
+          retention-days: 7
+
+  # ==========================================================
+  # JOB 2 — DEPLOY TO EC2 OVER SSH
+  # Only runs when the pipeline was started via "Run workflow"
+  # with run_deploy = true. Uses a GitHub Environment
+  # (dev or prod) so prod can require a manual approval.
+  # ==========================================================
+  deploy:
+    name: Deploy to EC2 (${{ github.event.inputs.environment }})
+    needs: build
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.run_deploy == 'true'
+    runs-on: [ self-hosted, linux ]
+
+    # This maps to Settings → Environments. Add "prod" with a
+    # required reviewer to force an approval before prod deploys.
+    environment: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Download the built artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-package
+
+      - name: Show what we are deploying
+        run: |
+          echo "Environment : ${{ github.event.inputs.environment }}"
+          echo "Artifact    : ${{ needs.build.outputs.artifact_name }}"
+
+      # Pick the right host/key based on the chosen environment.
+      # Secrets are named per-environment: EC2_HOST_DEV / EC2_HOST_PROD, etc.
+      - name: Select target host
+        id: target
+        run: |
+          if [ "${{ github.event.inputs.environment }}" = "prod" ]; then
+            echo "host=${{ secrets.EC2_HOST_PROD }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "host=${{ secrets.EC2_HOST_DEV }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Copy artifact to EC2 and restart service
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          SSH_USER: ${{ secrets.EC2_USER }}
+          HOST: ${{ steps.target.outputs.host }}
+          ARTIFACT: ${{ needs.build.outputs.artifact_name }}
+          APP_ENV: ${{ github.event.inputs.environment }}
+        run: |
+          set -euo pipefail
+          echo "$SSH_KEY" > deploy_key.pem
+          chmod 600 deploy_key.pem
+          SSH="ssh -o StrictHostKeyChecking=no -i deploy_key.pem"
+          SCP="scp -o StrictHostKeyChecking=no -i deploy_key.pem"
+
+          echo ">> Uploading $ARTIFACT to $HOST"
+          $SCP "$ARTIFACT" "$SSH_USER@$HOST:/tmp/$ARTIFACT"
+          $SCP scripts/deploy-remote.sh "$SSH_USER@$HOST:/tmp/deploy-remote.sh"
+
+          echo ">> Running remote deploy script"
+          $SSH "$SSH_USER@$HOST" \
+            "APP_ENV=$APP_ENV ARTIFACT=$ARTIFACT bash /tmp/deploy-remote.sh"
+
+          rm -f deploy_key.pem
+
+      - name: Smoke test the deployed app
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          SSH_USER: ${{ secrets.EC2_USER }}
+          HOST: ${{ steps.target.outputs.host }}
+        run: |
+          echo "$SSH_KEY" > deploy_key.pem && chmod 600 deploy_key.pem
+          ssh -o StrictHostKeyChecking=no -i deploy_key.pem \
+            "$SSH_USER@$HOST" "curl -sf http://localhost:3000/health"
+          rm -f deploy_key.pem

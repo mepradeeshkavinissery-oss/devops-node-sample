@@ -1,0 +1,25 @@
+# ============================================================
+# systemd unit for the sample app.
+# Install once on the EC2 instance:
+#   sudo cp devops-node-sample.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable devops-node-sample
+#   sudo systemctl start devops-node-sample
+# ============================================================
+[Unit]
+Description=DevOps Node Sample App
+After=network.target
+
+[Service]
+Type=simple
+# "current" is a symlink the deploy script re-points to each new release
+WorkingDirectory=/opt/devops-node-sample/current
+ExecStart=/bin/bash /opt/devops-node-sample/current/scripts/start-app.sh
+Restart=on-failure
+RestartSec=5
+User=ubuntu
+# Load environment written by the deploy script
+EnvironmentFile=-/opt/devops-node-sample/current/.env
+
+[Install]
+WantedBy=multi-user.target
